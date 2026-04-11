@@ -15,9 +15,9 @@ from telegram.ext import (
 )
 
 # =========================================
-# تحميل ملف .env المشترك
+# تحميل ملف .env إذا كان موجودًا محليًا
 # =========================================
-load_dotenv("/Users/samahsarsour/Desktop/mybot/.env")
+load_dotenv()
 
 BOT_TOKEN = os.getenv("ATTENDANCE_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -26,7 +26,11 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 # الملفات والأوراق
 # =========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-EXCEL_FILE = os.path.join(BASE_DIR, "attendance.xlsx")
+
+# محليًا سيُستخدم attendance.xlsx داخل مجلد المشروع
+# وعلى Render سنضبط EXCEL_FILE=/var/data/attendance.xlsx
+EXCEL_FILE = os.getenv("EXCEL_FILE", os.path.join(BASE_DIR, "attendance.xlsx"))
+
 COURSE_IMAGE = os.path.join(BASE_DIR, "course.png")
 
 SHEET_ATTENDANCE = "attendance"
@@ -73,7 +77,15 @@ def normalize_name(name: str) -> str:
 # =========================================
 # إدارة ملف Excel
 # =========================================
+def ensure_excel_directory():
+    excel_dir = os.path.dirname(EXCEL_FILE)
+    if excel_dir:
+        os.makedirs(excel_dir, exist_ok=True)
+
+
 def ensure_workbook():
+    ensure_excel_directory()
+
     if not os.path.exists(EXCEL_FILE):
         wb = Workbook()
 
@@ -408,7 +420,7 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================
 def main():
     if not BOT_TOKEN:
-        raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود في ملف .env")
+        raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود في Environment Variables أو .env")
 
     ensure_workbook()
 
