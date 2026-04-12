@@ -4,6 +4,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 
+PORT = int(os.environ.get("PORT", 10000))
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
