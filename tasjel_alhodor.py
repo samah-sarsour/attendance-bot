@@ -8,6 +8,7 @@ from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
@@ -15,6 +16,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Route
+import uvicorn
 
 # =========================================
 # تحميل .env محليًا إذا وجد
@@ -26,6 +33,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Attendance Bot")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # مثال: https://attendance-bot.onrender.com/webhook
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COURSE_IMAGE = os.path.join(BASE_DIR, "course.png")
@@ -46,6 +56,8 @@ attendance = {
     "message_chat_id": None,
     "message_id": None,
 }
+
+telegram_app: Application | None = None
 
 
 # =========================================
@@ -123,7 +135,7 @@ def read_names_from_sheet(sheet_name: str) -> list[str]:
     sh = get_spreadsheet()
     ws = sh.worksheet(sheet_name)
 
-    values = ws.col_values(1)[1:]  # تجاهل الهيدر
+    values = ws.col_values(1)[1:]
     names = []
     seen = set()
 
@@ -368,7 +380,6 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     attendance["active"] = False
-
     save_session_to_sheet()
 
     try:
@@ -403,17 +414,9 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================
-# التشغيل
+# Telegram application
 # =========================================
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود في Environment Variables أو .env")
-
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود في Environment Variables أو .env")
-
-    ensure_sheet_headers()
-
+def build_telegram_app() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -424,12 +427,71 @@ def main():
     app.add_handler(CallbackQueryHandler(register, pattern="^(register|closed)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_private_for_admin))
 
-    print("Bot is running...")
+    return app
+
+
+# =========================================
+# Webhook server
+# =========================================
+async def healthcheck(request: Request):
+    return PlainTextResponse("ok")
+
+
+async def telegram_webhook(request: Request):
+    global telegram_app
+
+    if telegram_app is None:
+        return JSONResponse({"ok": False, "error": "bot not ready"}, status_code=500)
+
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return JSONResponse({"ok": True})
+
+
+async def on_startup():
+    global telegram_app
+
+    if not BOT_TOKEN:
+        raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود")
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود")
+    if not WEBHOOK_URL:
+        raise ValueError("WEBHOOK_URL غير موجود")
+
+    ensure_sheet_headers()
+
+    telegram_app = build_telegram_app()
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    await telegram_app.bot.set_webhook(WEBHOOK_URL)
+
+    print("Bot is running with webhook...")
     print("ADMIN_ID =", ADMIN_ID)
     print("GOOGLE_SHEET_NAME =", GOOGLE_SHEET_NAME)
+    print("WEBHOOK_URL =", WEBHOOK_URL)
 
-    app.run_polling()
+
+async def on_shutdown():
+    global telegram_app
+
+    if telegram_app is not None:
+        await telegram_app.bot.delete_webhook()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+
+
+starlette_app = Starlette(
+    debug=False,
+    routes=[
+        Route("/healthz", healthcheck, methods=["GET"]),
+        Route("/webhook", telegram_webhook, methods=["POST"]),
+    ],
+    on_startup=[on_startup],
+    on_shutdown=[on_shutdown],
+)
 
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run(starlette_app, host="0.0.0.0", port=PORT)
