@@ -6,5 +6,5 @@ google-auth
 starlette
 uvicorn
 
-
+starlette==0.36.3
 
