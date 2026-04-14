@@ -1,10 +1,10 @@
 import os
+import json
 from datetime import datetime
 
 from dotenv import load_dotenv
-from openpyxl import Workbook, load_workbook
-
-PORT = int(os.environ.get("PORT", 10000))
+import gspread
+from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,22 +17,17 @@ from telegram.ext import (
 )
 
 # =========================================
-# تحميل ملف .env إذا كان موجودًا محليًا
+# تحميل .env محليًا إذا وجد
 # =========================================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("ATTENDANCE_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# =========================================
-# الملفات والأوراق
-# =========================================
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Attendance Bot")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# محليًا سيُستخدم attendance.xlsx داخل مجلد المشروع
-# وعلى Render سنضبط EXCEL_FILE=/var/data/attendance.xlsx
-EXCEL_FILE = os.getenv("EXCEL_FILE", os.path.join(BASE_DIR, "attendance.xlsx"))
-
 COURSE_IMAGE = os.path.join(BASE_DIR, "course.png")
 
 SHEET_ATTENDANCE = "attendance"
@@ -77,62 +72,62 @@ def normalize_name(name: str) -> str:
 
 
 # =========================================
-# إدارة ملف Excel
+# Google Sheets
 # =========================================
-def ensure_excel_directory():
-    excel_dir = os.path.dirname(EXCEL_FILE)
-    if excel_dir:
-        os.makedirs(excel_dir, exist_ok=True)
+def get_gspread_client():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود في Environment Variables أو .env")
+
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=scopes
+    )
+
+    return gspread.authorize(credentials)
 
 
-def ensure_workbook():
-    ensure_excel_directory()
+def get_spreadsheet():
+    gc = get_gspread_client()
+    return gc.open(GOOGLE_SHEET_NAME)
 
-    if not os.path.exists(EXCEL_FILE):
-        wb = Workbook()
 
-        ws_attendance = wb.active
-        ws_attendance.title = SHEET_ATTENDANCE
-        ws_attendance.append(["الاسم الثلاثي", "التاريخ", "وقت التسجيل", "الحالة"])
+def ensure_sheet_headers():
+    sh = get_spreadsheet()
 
-        ws_new = wb.create_sheet(SHEET_STUDENTS_NEW)
-        ws_new.append(["الاسم الثلاثي"])
+    needed = [
+        (SHEET_ATTENDANCE, ["الاسم الثلاثي", "التاريخ", "وقت التسجيل", "الحالة"]),
+        (SHEET_STUDENTS_NEW, ["الاسم الثلاثي"]),
+        (SHEET_STUDENTS_OLD, ["الاسم الثلاثي"]),
+    ]
 
-        ws_old = wb.create_sheet(SHEET_STUDENTS_OLD)
-        ws_old.append(["الاسم الثلاثي"])
+    for sheet_name, headers in needed:
+        try:
+            ws = sh.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
 
-        wb.save(EXCEL_FILE)
-        wb.close()
-        return
-
-    wb = load_workbook(EXCEL_FILE)
-
-    if SHEET_ATTENDANCE not in wb.sheetnames:
-        ws_attendance = wb.create_sheet(SHEET_ATTENDANCE)
-        ws_attendance.append(["الاسم الثلاثي", "التاريخ", "وقت التسجيل", "الحالة"])
-
-    if SHEET_STUDENTS_NEW not in wb.sheetnames:
-        ws_new = wb.create_sheet(SHEET_STUDENTS_NEW)
-        ws_new.append(["الاسم الثلاثي"])
-
-    if SHEET_STUDENTS_OLD not in wb.sheetnames:
-        ws_old = wb.create_sheet(SHEET_STUDENTS_OLD)
-        ws_old.append(["الاسم الثلاثي"])
-
-    wb.save(EXCEL_FILE)
-    wb.close()
+        row1 = ws.row_values(1)
+        if not row1:
+            ws.append_row(headers)
 
 
 def read_names_from_sheet(sheet_name: str) -> list[str]:
-    ensure_workbook()
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb[sheet_name]
+    ensure_sheet_headers()
+    sh = get_spreadsheet()
+    ws = sh.worksheet(sheet_name)
 
+    values = ws.col_values(1)[1:]  # تجاهل الهيدر
     names = []
     seen = set()
 
-    for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
-        full_name = row[0]
+    for full_name in values:
         if not full_name:
             continue
 
@@ -143,7 +138,6 @@ def read_names_from_sheet(sheet_name: str) -> list[str]:
             names.append(full_name)
             seen.add(key)
 
-    wb.close()
     return names
 
 
@@ -172,16 +166,14 @@ def add_student_to_new_sheet(full_name: str):
     if student_exists(full_name):
         return
 
-    ensure_workbook()
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb[SHEET_STUDENTS_NEW]
-    ws.append([full_name])
-    wb.save(EXCEL_FILE)
-    wb.close()
+    ensure_sheet_headers()
+    sh = get_spreadsheet()
+    ws = sh.worksheet(SHEET_STUDENTS_NEW)
+    ws.append_row([full_name])
 
 
-def save_session_to_excel():
-    ensure_workbook()
+def save_session_to_sheet():
+    ensure_sheet_headers()
 
     session_date = attendance["session_date"]
     present_records = attendance["records"]
@@ -192,16 +184,18 @@ def save_session_to_excel():
         for record in present_records
     }
 
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb[SHEET_ATTENDANCE]
+    sh = get_spreadsheet()
+    ws = sh.worksheet(SHEET_ATTENDANCE)
 
     written_present = set()
+    rows_to_add = []
+
     for record in present_records:
         key = normalize_name(record["full_name"])
         if key in written_present:
             continue
 
-        ws.append([
+        rows_to_add.append([
             record["full_name"],
             session_date,
             record["registered_time"],
@@ -212,15 +206,15 @@ def save_session_to_excel():
     for student_name in all_students:
         key = normalize_name(student_name)
         if key not in present_map:
-            ws.append([
+            rows_to_add.append([
                 student_name,
                 session_date,
                 "",
                 "لم يحضر",
             ])
 
-    wb.save(EXCEL_FILE)
-    wb.close()
+    if rows_to_add:
+        ws.append_rows(rows_to_add, value_input_option="USER_ENTERED")
 
 
 # =========================================
@@ -289,7 +283,7 @@ async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ليس لديك صلاحية.")
         return
 
-    ensure_workbook()
+    ensure_sheet_headers()
 
     attendance["active"] = True
     attendance["records"] = []
@@ -375,7 +369,7 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     attendance["active"] = False
 
-    save_session_to_excel()
+    save_session_to_sheet()
 
     try:
         if attendance["message_chat_id"] and attendance["message_id"]:
@@ -407,15 +401,6 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-    if os.path.exists(EXCEL_FILE):
-        with open(EXCEL_FILE, "rb") as f:
-            await context.bot.send_document(
-                chat_id=ADMIN_ID,
-                document=f,
-                filename="attendance.xlsx",
-                caption="📎 ملف الحضور المحدث"
-            )
-
 
 # =========================================
 # التشغيل
@@ -424,7 +409,10 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود في Environment Variables أو .env")
 
-    ensure_workbook()
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود في Environment Variables أو .env")
+
+    ensure_sheet_headers()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -438,7 +426,7 @@ def main():
 
     print("Bot is running...")
     print("ADMIN_ID =", ADMIN_ID)
-    print("EXCEL_FILE =", EXCEL_FILE)
+    print("GOOGLE_SHEET_NAME =", GOOGLE_SHEET_NAME)
 
     app.run_polling()
 

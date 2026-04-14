@@ -1,5 +1,4 @@
 .env
 __pycache__/
 *.pyc
-attendance.xlsx
-~$*.xlsx
+credentials.json
