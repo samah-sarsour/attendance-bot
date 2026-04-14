@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime
+from typing import Optional
 
 from dotenv import load_dotenv
 import gspread
@@ -28,14 +29,14 @@ import uvicorn
 # =========================================
 load_dotenv()
 
-BOT_TOKEN = os.getenv("ATTENDANCE_BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Attendance Bot")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-
+BOT_TOKEN = os.getenv("ATTENDANCE_BOT_TOKEN", "").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Attendance Bot").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # مثال: https://attendance-bot.onrender.com/webhook
+
+admin_raw = os.getenv("ADMIN_ID", "0").strip()
+ADMIN_ID = int(admin_raw) if admin_raw.isdigit() else 0
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COURSE_IMAGE = os.path.join(BASE_DIR, "course.png")
@@ -43,6 +44,8 @@ COURSE_IMAGE = os.path.join(BASE_DIR, "course.png")
 SHEET_ATTENDANCE = "attendance"
 SHEET_STUDENTS_NEW = "students new"
 SHEET_STUDENTS_OLD = "students old"
+
+telegram_app: Optional[Application] = None
 
 # =========================================
 # حالة الجلسة الحالية
@@ -56,8 +59,6 @@ attendance = {
     "message_chat_id": None,
     "message_id": None,
 }
-
-telegram_app: Application | None = None
 
 
 # =========================================
@@ -88,20 +89,19 @@ def normalize_name(name: str) -> str:
 # =========================================
 def get_gspread_client():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود في Environment Variables أو .env")
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود في Environment Variables")
 
-    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    try:
+        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"فشل قراءة GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
 
-    credentials = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=scopes
-    )
-
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     return gspread.authorize(credentials)
 
 
@@ -270,32 +270,47 @@ def build_text() -> str:
 # أوامر البوت
 # =========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلاً بك 👋\n\n"
-        "الأوامر المتاحة:\n"
-        "/start_attendance - بدء تسجيل الحضور\n"
-        "/show_attendance - عرض كشف الحضور الحالي\n"
-        "/end_attendance - إنهاء التسجيل\n"
-        "/myid - معرفة رقمك"
-    )
+    if update.message:
+        await update.message.reply_text(
+            "أهلاً بك 👋\n\n"
+            "الأوامر المتاحة:\n"
+            "/start_attendance - بدء تسجيل الحضور\n"
+            "/show_attendance - عرض كشف الحضور الحالي\n"
+            "/end_attendance - إنهاء التسجيل\n"
+            "/myid - معرفة رقمك"
+        )
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🆔 رقمك هو:\n{update.effective_user.id}")
+    if update.message and update.effective_user:
+        await update.message.reply_text(f"🆔 رقمك هو:\n{update.effective_user.id}")
 
 
 async def echo_private_for_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private" and is_admin(update.effective_user.id):
+    if (
+        update.message
+        and update.effective_chat
+        and update.effective_user
+        and update.effective_chat.type == "private"
+        and is_admin(update.effective_user.id)
+    ):
         text = update.message.text.strip()
         await update.message.reply_text(f"وصلتني رسالتك ✅\n\n{text}")
 
 
 async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("ليس لديك صلاحية.")
         return
 
-    ensure_sheet_headers()
+    try:
+        ensure_sheet_headers()
+    except Exception as e:
+        await update.message.reply_text(f"تعذر الاتصال بـ Google Sheets:\n{e}")
+        return
 
     attendance["active"] = True
     attendance["records"] = []
@@ -322,8 +337,10 @@ async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user = query.from_user
+    if query is None:
+        return
 
+    user = query.from_user
     await query.answer()
 
     if query.data == "closed":
@@ -341,7 +358,11 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = user.full_name or user.first_name or "بدون اسم"
     full_name = " ".join(full_name.split()).strip()
 
-    add_student_to_new_sheet(full_name)
+    try:
+        add_student_to_new_sheet(full_name)
+    except Exception as e:
+        await query.answer(f"تعذر التسجيل: {e}", show_alert=True)
+        return
 
     attendance["user_ids"].add(user.id)
     attendance["records"].append({
@@ -350,12 +371,12 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     try:
-        if query.message.photo:
+        if query.message and query.message.photo:
             await query.message.edit_caption(
                 caption=build_text(),
                 reply_markup=build_button(True)
             )
-        else:
+        elif query.message:
             await query.message.edit_text(
                 text=build_text(),
                 reply_markup=build_button(True)
@@ -367,10 +388,14 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_text())
+    if update.message:
+        await update.message.reply_text(build_text())
 
 
 async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("ليس لديك صلاحية.")
         return
@@ -379,8 +404,13 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لا توجد جلسة حضور مفتوحة الآن.")
         return
 
+    try:
+        save_session_to_sheet()
+    except Exception as e:
+        await update.message.reply_text(f"تعذر حفظ البيانات في Google Sheets:\n{e}")
+        return
+
     attendance["active"] = False
-    save_session_to_sheet()
 
     try:
         if attendance["message_chat_id"] and attendance["message_id"]:
@@ -396,7 +426,7 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if attendance["records"]:
         summary = "\n".join(
-            f"{i+1}. {record['full_name']} - {record['registered_time']}"
+            f"{i + 1}. {record['full_name']} - {record['registered_time']}"
             for i, record in enumerate(attendance["records"])
         )
     else:
@@ -417,6 +447,9 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Telegram application
 # =========================================
 def build_telegram_app() -> Application:
+    if not BOT_TOKEN:
+        raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -437,16 +470,23 @@ async def healthcheck(request: Request):
     return PlainTextResponse("ok")
 
 
+async def home(request: Request):
+    return PlainTextResponse("Bot is running")
+
+
 async def telegram_webhook(request: Request):
     global telegram_app
 
     if telegram_app is None:
         return JSONResponse({"ok": False, "error": "bot not ready"}, status_code=500)
 
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return JSONResponse({"ok": True})
+    try:
+        data = await request.json()
+        update = Update.de_json(data, telegram_app.bot)
+        await telegram_app.process_update(update)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 async def on_startup():
@@ -454,16 +494,19 @@ async def on_startup():
 
     if not BOT_TOKEN:
         raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود")
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود")
     if not WEBHOOK_URL:
         raise ValueError("WEBHOOK_URL غير موجود")
-
-    ensure_sheet_headers()
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود")
 
     telegram_app = build_telegram_app()
     await telegram_app.initialize()
     await telegram_app.start()
+
+    try:
+        await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
 
     await telegram_app.bot.set_webhook(WEBHOOK_URL)
 
@@ -477,7 +520,11 @@ async def on_shutdown():
     global telegram_app
 
     if telegram_app is not None:
-        await telegram_app.bot.delete_webhook()
+        try:
+            await telegram_app.bot.delete_webhook()
+        except Exception:
+            pass
+
         await telegram_app.stop()
         await telegram_app.shutdown()
 
@@ -485,6 +532,7 @@ async def on_shutdown():
 starlette_app = Starlette(
     debug=False,
     routes=[
+        Route("/", home, methods=["GET"]),
         Route("/healthz", healthcheck, methods=["GET"]),
         Route("/webhook", telegram_webhook, methods=["POST"]),
     ],
