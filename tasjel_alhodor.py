@@ -58,8 +58,12 @@ attendance = {
     "session_date": None,
     "message_chat_id": None,
     "message_id": None,
-}
 
+    # للأداء السريع
+    "known_students": set(),      # أسماء الطلاب المعروفين normalized
+    "all_students": [],           # كل الطلاب الحاليين بالأسماء الأصلية
+    "new_students_to_add": [],    # أسماء جديدة ستُحفظ عند النهاية فقط
+}
 
 # =========================================
 # دوال الوقت والمساعدة
@@ -89,7 +93,7 @@ def normalize_name(name: str) -> str:
 # =========================================
 def get_gspread_client():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود في Environment Variables")
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود")
 
     try:
         creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -131,7 +135,6 @@ def ensure_sheet_headers():
 
 
 def read_names_from_sheet(sheet_name: str) -> list[str]:
-    ensure_sheet_headers()
     sh = get_spreadsheet()
     ws = sh.worksheet(sheet_name)
 
@@ -153,35 +156,38 @@ def read_names_from_sheet(sheet_name: str) -> list[str]:
     return names
 
 
-def get_all_students() -> list[str]:
+def load_students_into_memory():
+    ensure_sheet_headers()
+
     old_names = read_names_from_sheet(SHEET_STUDENTS_OLD)
     new_names = read_names_from_sheet(SHEET_STUDENTS_NEW)
 
     all_names = []
-    seen = set()
+    known = set()
 
     for name in old_names + new_names:
-        key = normalize_name(name)
-        if key not in seen:
-            all_names.append(name)
-            seen.add(key)
+        clean_name = " ".join(name.split()).strip()
+        key = normalize_name(clean_name)
 
-    return all_names
+        if key not in known:
+            all_names.append(clean_name)
+            known.add(key)
+
+    attendance["known_students"] = known
+    attendance["all_students"] = all_names
+    attendance["new_students_to_add"] = []
 
 
-def student_exists(full_name: str) -> bool:
-    target = normalize_name(full_name)
-    return any(normalize_name(name) == target for name in get_all_students())
-
-
-def add_student_to_new_sheet(full_name: str):
-    if student_exists(full_name):
+def save_new_students_to_sheet():
+    if not attendance["new_students_to_add"]:
         return
 
     ensure_sheet_headers()
     sh = get_spreadsheet()
     ws = sh.worksheet(SHEET_STUDENTS_NEW)
-    ws.append_row([full_name])
+
+    rows = [[name] for name in attendance["new_students_to_add"]]
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
 def save_session_to_sheet():
@@ -189,32 +195,29 @@ def save_session_to_sheet():
 
     session_date = attendance["session_date"]
     present_records = attendance["records"]
-    all_students = get_all_students()
+    all_students = attendance["all_students"]
 
-    present_map = {
-        normalize_name(record["full_name"]): record
-        for record in present_records
-    }
+    present_map = {}
+    for record in present_records:
+        key = normalize_name(record["full_name"])
+        if key not in present_map:
+            present_map[key] = record
 
     sh = get_spreadsheet()
     ws = sh.worksheet(SHEET_ATTENDANCE)
 
-    written_present = set()
     rows_to_add = []
 
-    for record in present_records:
-        key = normalize_name(record["full_name"])
-        if key in written_present:
-            continue
-
+    # الحاضرون
+    for record in present_map.values():
         rows_to_add.append([
             record["full_name"],
             session_date,
             record["registered_time"],
             "حاضر",
         ])
-        written_present.add(key)
 
+    # غير الحاضرين
     for student_name in all_students:
         key = normalize_name(student_name)
         if key not in present_map:
@@ -307,7 +310,7 @@ async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        ensure_sheet_headers()
+        load_students_into_memory()
     except Exception as e:
         await update.message.reply_text(f"تعذر الاتصال بـ Google Sheets:\n{e}")
         return
@@ -317,6 +320,7 @@ async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     attendance["user_ids"] = set()
     attendance["started_at"] = now_dt()
     attendance["session_date"] = today_str()
+    attendance["new_students_to_add"] = []
 
     if os.path.exists(COURSE_IMAGE):
         with open(COURSE_IMAGE, "rb") as photo:
@@ -341,7 +345,6 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = query.from_user
-    await query.answer()
 
     if query.data == "closed":
         await query.answer("تم إغلاق التسجيل.", show_alert=True)
@@ -357,18 +360,24 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     full_name = user.full_name or user.first_name or "بدون اسم"
     full_name = " ".join(full_name.split()).strip()
+    normalized = normalize_name(full_name)
 
-    try:
-        add_student_to_new_sheet(full_name)
-    except Exception as e:
-        await query.answer(f"تعذر التسجيل: {e}", show_alert=True)
-        return
+    # إذا الاسم جديد، نحفظه في الذاكرة فقط
+    if normalized not in attendance["known_students"]:
+        attendance["known_students"].add(normalized)
+        attendance["all_students"].append(full_name)
+        attendance["new_students_to_add"].append(full_name)
 
     attendance["user_ids"].add(user.id)
     attendance["records"].append({
         "full_name": full_name,
         "registered_time": time_str(),
     })
+
+    try:
+        await query.answer("تم تسجيل حضورك ✅", show_alert=True)
+    except Exception:
+        pass
 
     try:
         if query.message and query.message.photo:
@@ -383,8 +392,6 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception:
         pass
-
-    await query.answer("تم تسجيل حضورك ✅", show_alert=True)
 
 
 async def show_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,6 +412,7 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        save_new_students_to_sheet()
         save_session_to_sheet()
     except Exception as e:
         await update.message.reply_text(f"تعذر حفظ البيانات في Google Sheets:\n{e}")
@@ -432,15 +440,29 @@ async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         summary = "لا يوجد حضور مسجل."
 
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=(
-            "📋 الملخص النهائي\n\n"
-            f"📅 التاريخ: {attendance['session_date']}\n"
-            f"👥 العدد: {len(attendance['records'])}\n\n"
-            f"{summary}"
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "📋 الملخص النهائي\n\n"
+                f"📅 التاريخ: {attendance['session_date']}\n"
+                f"👥 العدد: {len(attendance['records'])}\n\n"
+                f"{summary}"
+            )
         )
-    )
+    except Exception:
+        pass
+
+    # تصفير الجلسة
+    attendance["records"] = []
+    attendance["user_ids"] = set()
+    attendance["started_at"] = None
+    attendance["session_date"] = None
+    attendance["message_chat_id"] = None
+    attendance["message_id"] = None
+    attendance["known_students"] = set()
+    attendance["all_students"] = []
+    attendance["new_students_to_add"] = []
 
 
 # =========================================
@@ -466,12 +488,12 @@ def build_telegram_app() -> Application:
 # =========================================
 # Webhook server
 # =========================================
-async def healthcheck(request: Request):
-    return PlainTextResponse("ok")
-
-
 async def home(request: Request):
     return PlainTextResponse("Bot is running")
+
+
+async def healthcheck(request: Request):
+    return PlainTextResponse("ok")
 
 
 async def telegram_webhook(request: Request):
