@@ -23,6 +23,9 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 import uvicorn
 
+# =========================================
+# تحميل .env محليًا إذا وجد
+# =========================================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("ATTENDANCE_BOT_TOKEN", "").strip()
@@ -43,7 +46,9 @@ COURSE_IMAGE = os.path.join(BASE_DIR, "course.png")
 
 telegram_app: Optional[Application] = None
 
-
+# =========================================
+# التوقيت - السعودية
+# =========================================
 def now_dt() -> datetime:
     return datetime.now(ZoneInfo("Asia/Riyadh"))
 
@@ -56,6 +61,9 @@ def time_str() -> str:
     return now_dt().strftime("%I:%M %p")
 
 
+# =========================================
+# مساعدات عامة
+# =========================================
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
@@ -64,25 +72,43 @@ def normalize_name(name: str) -> str:
     return " ".join((name or "").strip().split()).casefold()
 
 
+# =========================================
+# حالة الجلسة الحالية
+# =========================================
 attendance = {
     "active": False,
     "records": [],
     "user_ids": set(),
     "started_at": None,
     "session_date": None,
-    "message_chat_id": None,
-    "message_id": None,
+
+    # رسالة القائمة النصية
+    "status_chat_id": None,
+    "status_message_id": None,
+
+    # رسالة الصورة + الزر
+    "button_chat_id": None,
+    "button_message_id": None,
+
+    # بيانات الطلاب في الذاكرة
     "known_students": set(),
     "all_students": [],
     "new_students": [],
 }
 
 
+# =========================================
+# Google Sheets
+# =========================================
 def get_client():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود")
 
-    creds = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    try:
+        creds = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"فشل قراءة GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -115,7 +141,7 @@ def ensure_sheet_headers():
             ws.append_row(headers)
 
 
-def read_names(sheet_name: str):
+def read_names(sheet_name: str) -> list[str]:
     sh = get_sheet()
     ws = sh.worksheet(sheet_name)
     values = ws.col_values(1)[1:]
@@ -189,19 +215,23 @@ def save_all():
         ws_att.append_rows(rows, value_input_option="USER_ENTERED")
 
 
+# =========================================
+# واجهة الرسائل
+# =========================================
 def build_button(active=True):
     if active:
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("تسجيل الحضور", callback_data="reg")]]
-        )
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("تم إغلاق التسجيل", callback_data="closed")]]
-    )
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("تسجيل الحضور", callback_data="reg")]
+        ])
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("تم إغلاق التسجيل", callback_data="closed")]
+    ])
 
 
 def build_text():
     if not attendance["records"]:
-        names = "لا يوجد تسجيل"
+        names = "لا يوجد تسجيل حتى الآن"
     else:
         names = "\n".join(
             f"{i+1}) {r['full_name']} - {r['time']}"
@@ -211,32 +241,56 @@ def build_text():
     start_time = attendance["started_at"].strftime("%I:%M %p") if attendance["started_at"] else "-"
 
     return (
-        f"📋 كشف الحضور\n\n"
+        "📋 كشف الحضور\n"
+        "━━━━━━━━━━━━\n\n"
         f"📅 التاريخ: {attendance['session_date']}\n"
         f"🕒 وقت البداية: {start_time}\n"
         f"👥 العدد: {len(attendance['records'])}\n\n"
+        "━━━━━━━━━━━━\n"
         f"{names}"
     )
 
 
+# =========================================
+# الأوامر
+# =========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("البوت يعمل ✅")
+        await update.message.reply_text(
+            "البوت يعمل ✅\n\n"
+            "الأوامر:\n"
+            "/start_attendance\n"
+            "/end_attendance"
+        )
 
 
 async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
+    if not update.effective_user:
         return
 
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("ليس لديك صلاحية.")
+        if update.message:
+            await update.message.reply_text("ليس لديك صلاحية.")
         return
 
     try:
         load_students()
     except Exception as e:
-        await update.message.reply_text(f"تعذر الاتصال بـ Google Sheets:\n{e}")
+        if update.message:
+            await update.message.reply_text(f"تعذر الاتصال بـ Google Sheets:\n{e}")
         return
+
+    # إغلاق زر الجلسة السابقة إن وجد
+    if attendance["active"]:
+        try:
+            if attendance["button_chat_id"] and attendance["button_message_id"]:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=attendance["button_chat_id"],
+                    message_id=attendance["button_message_id"],
+                    reply_markup=build_button(False)
+                )
+        except Exception:
+            pass
 
     attendance["active"] = True
     attendance["records"] = []
@@ -245,21 +299,30 @@ async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     attendance["session_date"] = today_str()
     attendance["new_students"] = []
 
+    if not update.message:
+        return
+
+    # 1) رسالة القائمة النصية
+    status_msg = await update.message.reply_text(build_text())
+    attendance["status_chat_id"] = status_msg.chat_id
+    attendance["status_message_id"] = status_msg.message_id
+
+    # 2) رسالة الصورة + الزر
     if os.path.exists(COURSE_IMAGE):
         with open(COURSE_IMAGE, "rb") as photo:
-            sent = await update.message.reply_photo(
+            button_msg = await update.message.reply_photo(
                 photo=photo,
-                caption=build_text(),
+                caption="اضغط الزر لتسجيل الحضور",
                 reply_markup=build_button(True)
             )
     else:
-        sent = await update.message.reply_text(
-            build_text(),
+        button_msg = await update.message.reply_text(
+            "اضغط الزر لتسجيل الحضور",
             reply_markup=build_button(True)
         )
 
-    attendance["message_chat_id"] = sent.chat_id
-    attendance["message_id"] = sent.message_id
+    attendance["button_chat_id"] = button_msg.chat_id
+    attendance["button_message_id"] = button_msg.message_id
 
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,64 +361,85 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.answer("تم تسجيل حضورك ✅", show_alert=True)
 
+    # تحديث رسالة القائمة فقط
     try:
-        if q.message and q.message.photo:
-            await q.message.edit_caption(
-                caption=build_text(),
-                reply_markup=build_button(True)
-            )
-        elif q.message:
-            await q.message.edit_text(
-                text=build_text(),
-                reply_markup=build_button(True)
+        if attendance["status_chat_id"] and attendance["status_message_id"]:
+            await context.bot.edit_message_text(
+                chat_id=attendance["status_chat_id"],
+                message_id=attendance["status_message_id"],
+                text=build_text()
             )
     except Exception:
         pass
 
 
 async def end_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
+    if not update.effective_user:
         return
 
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("ليس لديك صلاحية.")
+        if update.message:
+            await update.message.reply_text("ليس لديك صلاحية.")
         return
 
     if not attendance["active"]:
-        await update.message.reply_text("لا توجد جلسة حضور مفتوحة الآن.")
+        if update.message:
+            await update.message.reply_text("لا توجد جلسة حضور مفتوحة الآن.")
         return
 
     try:
         save_all()
     except Exception as e:
-        await update.message.reply_text(f"حدث خطأ أثناء الحفظ:\n{e}")
+        if update.message:
+            await update.message.reply_text(f"حدث خطأ أثناء الحفظ:\n{e}")
         return
 
     attendance["active"] = False
 
+    # إغلاق زر التسجيل
     try:
-        if attendance["message_chat_id"] and attendance["message_id"]:
+        if attendance["button_chat_id"] and attendance["button_message_id"]:
             await context.bot.edit_message_reply_markup(
-                chat_id=attendance["message_chat_id"],
-                message_id=attendance["message_id"],
+                chat_id=attendance["button_chat_id"],
+                message_id=attendance["button_message_id"],
                 reply_markup=build_button(False)
             )
     except Exception:
         pass
 
-    await update.message.reply_text("تم الحفظ ✅")
+    if update.message:
+        await update.message.reply_text("تم حفظ الحضور ✅")
+
+    # تصفير الجلسة الحالية
+    attendance["records"] = []
+    attendance["user_ids"] = set()
+    attendance["started_at"] = None
+    attendance["session_date"] = None
+    attendance["status_chat_id"] = None
+    attendance["status_message_id"] = None
+    attendance["button_chat_id"] = None
+    attendance["button_message_id"] = None
+    attendance["known_students"] = set()
+    attendance["all_students"] = []
+    attendance["new_students"] = []
 
 
+# =========================================
+# Webhook
+# =========================================
 async def webhook(request: Request):
     global telegram_app
 
     if telegram_app is None:
         return JSONResponse({"ok": False, "error": "bot not ready"}, status_code=500)
 
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return JSONResponse({"ok": True})
+    try:
+        data = await request.json()
+        update = Update.de_json(data, telegram_app.bot)
+        await telegram_app.process_update(update)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 async def home(request: Request):
@@ -373,6 +457,8 @@ async def startup():
         raise ValueError("ATTENDANCE_BOT_TOKEN غير موجود")
     if not WEBHOOK_URL:
         raise ValueError("WEBHOOK_URL غير موجود")
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON غير موجود")
 
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -383,6 +469,12 @@ async def startup():
 
     await telegram_app.initialize()
     await telegram_app.start()
+
+    try:
+        await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
     await telegram_app.bot.set_webhook(WEBHOOK_URL)
 
 
