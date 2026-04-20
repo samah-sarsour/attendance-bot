@@ -255,6 +255,14 @@ def build_text():
 # الأوامر
 # =========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("START CALLED")
+    print("chat type:", update.effective_chat.type if 
+update.effective_chat else None)
+    print("chat id:", update.effective_chat.id if update.effective_chat 
+else None)
+    print("user id:", update.effective_user.id if update.effective_user 
+else None)
+
     if update.message:
         await update.message.reply_text(
             "البوت يعمل ✅\n\n"
@@ -263,8 +271,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/end_attendance"
         )
 
-
 async def start_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+print("START_ATTENDANCE CALLED")
+print("chat type:", update.effective_chat.type if update.effective_chat else None)
+print("chat id:", update.effective_chat.id if update.effective_chat else None)
+print("user id:", update.effective_user.id if update.effective_user else None)
+print("admin id:", ADMIN_ID)
     if not update.effective_user:
         return
 
